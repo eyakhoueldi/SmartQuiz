@@ -11,7 +11,7 @@ from langchain_core.messages import (
     AIMessage,
     SystemMessage,
     ToolMessage,
-    BaseMessage
+    BaseMessage,
 )
 from quiz.tools import ALL_TOOLS
 
@@ -34,16 +34,17 @@ Always use the most appropriate tool(s) based on user intent. If the user is ask
 Be helpful, clear, accurate, and engaging.
 """
 
+
 def run_agent(user_input: str, chat_history: list) -> str:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key.strip() == "":
         raise ValueError("GROQ_API_KEY is missing or empty in .env file")
 
     llm = ChatGroq(
-        model="llama-3.3-70b-versatile",   # Excellent balance of speed & quality
+        model="llama-3.3-70b-versatile",
         temperature=0.6,
         max_tokens=1024,
-        api_key=SecretStr(api_key)
+        api_key=SecretStr(api_key),
     )
 
     llm_with_tools = llm.bind_tools(ALL_TOOLS)
@@ -51,7 +52,7 @@ def run_agent(user_input: str, chat_history: list) -> str:
 
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
 
-    # Add chat history
+    # Replay chat history into message list
     for msg in chat_history:
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
@@ -60,8 +61,8 @@ def run_agent(user_input: str, chat_history: list) -> str:
 
     messages.append(HumanMessage(content=user_input))
 
-    # Tool calling loop
-    for _ in range(6):  # Increased slightly for better reasoning
+    # Agentic tool-calling loop (max 6 iterations)
+    for _ in range(6):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
@@ -82,7 +83,7 @@ def run_agent(user_input: str, chat_history: list) -> str:
             messages.append(
                 ToolMessage(
                     content=str(result),
-                    tool_call_id=tool_id
+                    tool_call_id=tool_id,
                 )
             )
 

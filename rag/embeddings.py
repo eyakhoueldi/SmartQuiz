@@ -8,8 +8,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 COLLECTION_NAME = "smartquiz_docs"
 VECTORSTORE_PATH = "./vectorstore"
 
-# Note: chromadb's type stubs have a known variance bug with EmbeddingFunction.
-# The cast trick doesn't fully resolve it either, so we use type: ignore here.
+
 _embed_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 
 
