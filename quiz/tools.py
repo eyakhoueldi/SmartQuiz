@@ -1,89 +1,88 @@
 import sys
 import os
+# Ensure the project root is importable regardless of where the script is invoked from
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langchain.tools import tool
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+from pydantic import SecretStr
 from rag.retriever import retrieve_context
 from quiz.generator import generate_quiz
-from groq import Groq
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# 8b is fine here — no tool calling, just text generation
+_TOOL_MODEL = "llama-3.1-8b-instant"
 
-# ─────────────────────────────────────────────
-# In-memory session store for generated quizzes
-# Key: topic (str)  →  Value: list of question dicts
-# This lets evaluate_answers fetch the EXACT same
-# question objects (including correct answers) that
-# were produced during generation, without calling
-# the LLM a second time.
-# ─────────────────────────────────────────────
+
+def _get_llm() -> ChatGroq:
+    # Build a fresh ChatGroq instance each call (stateless, no shared mutable state)
+    return ChatGroq(
+        model=_TOOL_MODEL,
+        temperature=0.5,
+        max_tokens=600,
+        api_key=SecretStr(os.getenv("GROQ_API_KEY", "")),
+    )
+
+
+# ── Quiz cache ─────────────────────────────────────────────────────────────────
+# In-memory store mapping lowercased topic keys to their generated question lists
 _quiz_session: dict[str, list] = {}
 
 
 def get_cached_quiz(topic: str) -> list:
-    """Return the most-recently generated quiz for a topic (or [] if none)."""
+    # Return previously generated questions for a topic, or empty list if none exist
     return _quiz_session.get(topic.lower().strip(), [])
 
 
 def get_latest_quiz() -> list:
-    """Return the last quiz that was generated, regardless of topic."""
+    # Return whichever quiz was generated most recently across all topics
     if not _quiz_session:
         return []
-    last_key = list(_quiz_session.keys())[-1]
-    return _quiz_session[last_key]
+    return _quiz_session[list(_quiz_session.keys())[-1]]
 
+
+# ── Tool definitions ───────────────────────────────────────────────────────────
 
 @tool
 def search_tool(query: str) -> str:
     """Search the uploaded documents for relevant information about a topic or question."""
-    return retrieve_context(query, n_results=5)
+    return retrieve_context(query, n_results=4)
 
 
 @tool
 def quiz_tool(topic: str) -> str:
     """Generate 5 MCQ quiz questions about a given topic from the uploaded documents."""
     questions = generate_quiz(topic, num_questions=5, quiz_type="MCQ", difficulty="Medium")
-
-    # ✅ Persist the questions so evaluate_answers can use the same list later
-    _quiz_session[topic.lower().strip()] = questions
-    # Also store under a fixed key so get_latest_quiz() always works
+    key = topic.lower().strip()
+    # Cache under both the specific topic key and a generic latest-quiz sentinel
+    _quiz_session[key]          = questions
     _quiz_session["__latest__"] = questions
 
-    output = ""
+    # Format questions into a readable markdown-style string for the chat UI
+    lines = []
     for i, q in enumerate(questions, 1):
-        output += f"\n**Q{i}: {q['question']}**\n"
+        lines.append(f"\n**Q{i}: {q['question']}**")
         for opt in q.get("options", []):
-            output += f" {opt}\n"
-        # ⚠️  Do NOT reveal the answer in the chat output –
-        #     it was leaking correct answers to the user and
-        #     making "wrong" answers look right in the UI.
-        #     Remove or comment the next two lines if you want
-        #     answers hidden during the quiz attempt.
-        output += f" *(Answer stored – submit your responses to see results)*\n"
-        if "explanation" in q:
-            output += f" *(Explanation available after submission)*\n"
-
-    return output
+            lines.append(f" {opt}")
+        lines.append(" *(Submit your responses to see results)*")
+    return "\n".join(lines)
 
 
 @tool
 def summary_tool(topic: str) -> str:
-    """Summarize a topic or chapter based on the uploaded documents."""
-    context = retrieve_context(topic, n_results=6)
-    prompt = f"""Based on the following context from the user's documents, write a clear, well-structured, and concise summary of: {topic}
-
-Context:
-{context}
-
-Summary:"""
-
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=800,
+    """Summarise a topic or chapter based on the uploaded documents."""
+    context = retrieve_context(topic, n_results=4)
+    # Build a focused prompt that constrains the LLM to the retrieved context only
+    prompt  = (
+        f"Using these document excerpts, write a concise summary of: {topic}\n\n"
+        f"Context:\n{context}\n\nSummary:"
     )
-    content = response.choices[0].message.content
-    return content.strip() if content else "Could not generate summary."
+    try:
+        resp = _get_llm().invoke([HumanMessage(content=prompt)])
+        # Extract text content from the response object; fall back if empty
+        return getattr(resp, "content", "").strip() or "Could not generate summary."
+    except Exception as e:
+        return f"Summary failed: {e}"
 
 
+# Exported list of all registered tools — consumed by the LangChain agent
 ALL_TOOLS = [search_tool, quiz_tool, summary_tool]

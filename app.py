@@ -11,6 +11,7 @@ from quiz.generator import generate_quiz
 from quiz.evaluator import evaluate_answers
 from quiz.flashcards import generate_flashcards
 from agent.agent import run_agent
+from chat_history import load_history, save_session, delete_session, auto_title
 
 st.set_page_config(
     page_title="SmartQuiz AI",
@@ -20,10 +21,13 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE  (only write missing keys once)
+# SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
+# All keys the app needs — initialised once so subsequent reruns don't reset them
 _DEFAULTS = {
     "chat_history": [],
+    "all_sessions": [],          # list of {id, title, messages}
+    "active_session_id": None,
     "quiz_questions": [], "quiz_answers": {}, "quiz_submitted": False, "quiz_type": "MCQ",
     "uploaded_files": [],
     "fc_cards": [], "fc_index": 0, "fc_known": set(), "fc_unknown": set(),
@@ -35,9 +39,22 @@ for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# ── Restore persisted history on first load ───────────────────────────────────
+# If the in-memory session list is empty, try loading from disk and wrap it in a session object
+if not st.session_state.all_sessions:
+    persisted = load_history()
+    if persisted:
+        title = auto_title(persisted)
+        import time
+        sid = str(int(time.time()))
+        st.session_state.all_sessions = [{"id": sid, "title": title, "messages": persisted}]
+        st.session_state.chat_history = persisted
+        st.session_state.active_session_id = sid
+
 # ══════════════════════════════════════════════════════════════════════════════
-# DESIGN SYSTEM  — injected once per session via a flag
+# DESIGN SYSTEM
 # ══════════════════════════════════════════════════════════════════════════════
+# Single large CSS block injected once — all custom theming lives here
 _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?:wght@400;500;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap');
@@ -66,11 +83,9 @@ header[data-testid="stHeader"]{background:transparent!important;box-shadow:none!
 [data-testid="stSidebarCollapsedControl"]{display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;z-index:999999!important;}
 .block-container{padding:2.75rem 2rem 5rem 2rem!important;max-width:1100px!important;margin:0 auto!important;}
 
-/* fc-pills — hidden until CSS is ready to prevent FOUC */
 .fc-pills{
   display:flex;justify-content:center;align-items:center;gap:14px;flex-wrap:wrap;
   width:100%;margin:20px 0;
-  /* start invisible; the keyframe below reveals after first paint */
   animation:fcReveal .01s forwards;
 }
 @keyframes fcReveal{to{opacity:1;}}
@@ -93,6 +108,37 @@ header[data-testid="stHeader"]{background:transparent!important;box-shadow:none!
 .sb-section{font-size:9.5px!important;font-weight:700!important;letter-spacing:2.8px!important;text-transform:uppercase!important;color:var(--muted)!important;padding:18px 22px 5px!important;}
 .file-pill{display:flex;align-items:center;gap:8px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:11.5px;color:var(--text);margin:3px 14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .file-pill-icon{color:var(--a1)!important;font-size:12px;flex-shrink:0;}
+
+/* ── Chat History Panel ── */
+.ch-panel{padding:0 0 4px 0;}
+.ch-empty{padding:10px 22px 14px;font-size:12px;color:var(--muted);line-height:1.6;}
+
+/* Session button override — make st.button look like a session row */
+[data-testid="stSidebar"] .ch-btn button {
+  background:transparent!important;
+  border:1px solid transparent!important;
+  border-radius:10px!important;
+  padding:10px 12px!important;
+  text-align:left!important;
+  font-size:12.5px!important;
+  font-weight:500!important;
+  color:var(--muted2)!important;
+  transition:all .16s ease!important;
+  width:100%!important;
+  display:flex!important;
+  align-items:center!important;
+  gap:8px!important;
+}
+[data-testid="stSidebar"] .ch-btn button:hover{
+  background:rgba(124,111,255,.07)!important;
+  border-color:rgba(124,111,255,.18)!important;
+  color:var(--text)!important;
+}
+[data-testid="stSidebar"] .ch-btn.active button{
+  background:linear-gradient(135deg,rgba(124,111,255,.14),rgba(194,111,255,.09))!important;
+  border-color:rgba(124,111,255,.28)!important;
+  color:#fff!important;
+}
 
 /* ── Page header ── */
 .page-header{margin-bottom:32px;padding-bottom:22px;border-bottom:1px solid var(--border);}
@@ -181,12 +227,11 @@ hr{border:none!important;border-top:1px solid rgba(124,111,255,.12)!important;ma
 ::-webkit-scrollbar-thumb{background:rgba(124,111,255,.2);border-radius:10px;}
 ::-webkit-scrollbar-thumb:hover{background:rgba(124,111,255,.4);}
 
-/* ── Flashcard pills — fixed size, no FOUC ── */
+/* ── Flashcard pills ── */
 .fc-pill{
   border-radius:50px;padding:8px 16px;font-size:12px;font-weight:600;letter-spacing:.1px;
   display:inline-flex;align-items:center;gap:6px;white-space:nowrap;line-height:1.2;
   border:1.5px solid;backdrop-filter:blur(6px);transition:all .3s ease;
-  /* hard sizes so the row never jumps */
   min-width:108px;justify-content:center;
 }
 .fc-pill.g{background:linear-gradient(135deg,rgba(52,211,153,.15),rgba(52,211,153,.08));border-color:rgba(52,211,153,.5);color:#34d399;box-shadow:0 2px 12px rgba(52,211,153,.15);}
@@ -209,17 +254,18 @@ p{font-size:13.5px;line-height:1.6;}
 </style>
 """
 
-# Inject CSS only once per session (stored in a hidden component slot, not re-executed)
 st.markdown(_CSS, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR TOGGLE JS — injected once via session flag
+# SIDEBAR TOGGLE JS
 # ══════════════════════════════════════════════════════════════════════════════
+# Injects a floating hamburger/close button that controls the Streamlit sidebar
+# from outside the iframe boundary using window.parent DOM access
 _SIDEBAR_JS = """
 <script>
 (function(){
   var doc=window.parent.document,win=window.parent,BTN_ID='sq-sidebar-btn';
-  if(doc.getElementById(BTN_ID))return; // guard: already injected
+  if(doc.getElementById(BTN_ID))return;
   var IO='<svg width="18" height="14" viewBox="0 0 18 14" fill="none"><rect width="18" height="2" rx="1" fill="white"/><rect y="6" width="12" height="2" rx="1" fill="white"/><rect y="12" width="18" height="2" rx="1" fill="white"/></svg>';
   var IC='<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><line x1="1" y1="1" x2="12" y2="12" stroke="white" stroke-width="2" stroke-linecap="round"/><line x1="12" y1="1" x2="1" y2="12" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>';
   function vis(){var sb=doc.querySelector('[data-testid="stSidebar"]');if(!sb)return false;var cs=win.getComputedStyle(sb);if(cs.display==='none'||cs.visibility==='hidden')return false;var r=sb.getBoundingClientRect();return r.width>80&&r.left>-10;}
@@ -237,19 +283,62 @@ _SIDEBAR_JS = """
   setInterval(function(){
     var b=doc.getElementById(BTN_ID);if(!b)return;
     var open=vis();
+    // Update button icon and position to reflect current sidebar state
     if(open!==_last){b.innerHTML=open?IC:IO;b.title=open?'Close sidebar':'Open sidebar';b.style.left=open?'calc(21rem - 54px)':'12px';_last=open;}
   },350);
 })();
 </script>
 """
 
-# Use a stable key so Streamlit skips re-rendering this component on reruns
 components.html(_SIDEBAR_JS, height=0)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS  (defined early so they can be used anywhere below)
+# ══════════════════════════════════════════════════════════════════════════════
+def page_header(title, subtitle):
+    # Render the standard gradient page title + subtitle used on every tab
+    st.markdown(f"""
+    <div class="page-header">
+        <div class="page-title">{title}</div>
+        <p class="page-sub">{subtitle}</p>
+    </div>""", unsafe_allow_html=True)
+
+def no_docs_warning():
+    # Shown on every page when no documents have been uploaded yet
+    st.warning("Upload at least one document from the sidebar to get started.")
+
+def esc(s):
+    """Escape a string for safe embedding in HTML attributes / inline JS."""
+    return s.replace("&", "&amp;").replace("'", "\\'").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _save_current_session():
+    """Upsert the current chat into all_sessions."""
+    import time
+    sid = st.session_state.active_session_id
+    # Create a new session ID if one doesn't exist yet
+    if not sid:
+        sid = str(int(time.time()))
+        st.session_state.active_session_id = sid
+    title = auto_title(st.session_state.chat_history)
+    # Update the existing session record in-place if it already exists
+    for s in st.session_state.all_sessions:
+        if s["id"] == sid:
+            s["messages"] = list(st.session_state.chat_history)
+            s["title"] = title
+            return
+    # Otherwise append a brand-new session entry
+    st.session_state.all_sessions.append({
+        "id": sid,
+        "title": title,
+        "messages": list(st.session_state.chat_history),
+    })
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
+    # Brand header with glow effect
     st.markdown("""
     <div class="sb-logo">
         <span class="sb-logo-icon">🧠</span>
@@ -262,6 +351,64 @@ with st.sidebar:
     page = st.radio("nav", ["💬  Chat", "📝  Quiz", "🃏  Flashcards"], label_visibility="collapsed")
     st.divider()
 
+    # ── Chat History Panel ────────────────────────────────────────────────────
+    st.markdown('<div class="sb-section">Conversations</div>', unsafe_allow_html=True)
+
+    # New Chat button — saves the current session before resetting state
+    st.markdown("<div style='padding:4px 10px 8px;'>", unsafe_allow_html=True)
+    if st.button("✏️  New Chat", type="primary", use_container_width=True, key="sb_new_chat"):
+        # Save current chat before clearing
+        if st.session_state.chat_history:
+            _save_current_session()
+        # Start a fresh session
+        import time
+        new_sid = str(int(time.time())) + "_new"
+        st.session_state.chat_history = []
+        st.session_state.active_session_id = new_sid
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Session list — one button per session, no duplicate HTML cards
+    sessions = st.session_state.all_sessions
+    active_id = st.session_state.active_session_id
+
+    if sessions:
+        for s in reversed(sessions):  # newest first
+            is_active = s["id"] == active_id
+            msg_count = len([m for m in s["messages"] if m["role"] == "user"])
+            short_title = s["title"][:30] + "…" if len(s["title"]) > 30 else s["title"]
+            label = f"💬  {short_title}\n{msg_count} message{'s' if msg_count != 1 else ''}"
+
+            btn_type = "primary" if is_active else "secondary"
+            if st.button(label, key=f"sess_{s['id']}", use_container_width=True, type=btn_type):
+                if not is_active:
+                    # Save current chat first
+                    if st.session_state.chat_history and active_id:
+                        _save_current_session()
+                    # Load selected session
+                    st.session_state.chat_history = list(s["messages"])
+                    st.session_state.active_session_id = s["id"]
+                    st.rerun()
+    else:
+        st.markdown("""
+        <div class="ch-empty">
+            No saved conversations yet.<br>Start chatting to save your history.
+        </div>""", unsafe_allow_html=True)
+
+    # Clear all history — wipes both in-memory state and the persisted store
+    if sessions:
+        st.markdown("<div style='padding:6px 10px 2px;'>", unsafe_allow_html=True)
+        if st.button("🗑  Clear all history", type="secondary", use_container_width=True, key="sb_clear_history"):
+            st.session_state.all_sessions = []
+            st.session_state.chat_history = []
+            st.session_state.active_session_id = None
+            delete_session()
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── Documents Panel ───────────────────────────────────────────────────────
     st.markdown('<div class="sb-section">Documents</div>', unsafe_allow_html=True)
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -271,9 +418,11 @@ with st.sidebar:
 
     if uploaded:
         for file in uploaded:
+            # Skip files that have already been indexed in this session
             if file.name not in st.session_state.uploaded_files:
                 os.makedirs("uploads", exist_ok=True)
                 path = os.path.join("uploads", file.name)
+                # Write the raw bytes to disk so the loader can read them
                 with open(path, "wb") as f:
                     f.write(file.read())
                 with st.spinner(f"Indexing {file.name}…"):
@@ -286,10 +435,12 @@ with st.sidebar:
     if st.session_state.uploaded_files:
         st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
         for fname in st.session_state.uploaded_files:
+            # Truncate long filenames to keep the pill tidy
             short = fname if len(fname) < 26 else fname[:23] + "…"
             st.markdown(f'<div class="file-pill"><span class="file-pill-icon">📄</span><span>{short}</span></div>', unsafe_allow_html=True)
         st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
         if st.button("Clear all", type="secondary", use_container_width=True):
+            # Drop the entire vector store collection and reset the file list
             clear_collection()
             st.session_state.uploaded_files = []
             st.rerun()
@@ -299,29 +450,17 @@ with st.sidebar:
             Upload PDF or TXT files to get started. Documents are used to generate quizzes, flashcards and answers.
         </div>""", unsafe_allow_html=True)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def page_header(title, subtitle):
-    st.markdown(f"""
-    <div class="page-header">
-        <div class="page-title">{title}</div>
-        <p class="page-sub">{subtitle}</p>
-    </div>""", unsafe_allow_html=True)
-
-def no_docs_warning():
-    st.warning("Upload at least one document from the sidebar to get started.")
-
-def esc(s):
-    """Escape a string for safe embedding in HTML attributes / inline JS."""
-    return s.replace("&", "&amp;").replace("'", "\\'").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FLASHCARD HTML — built once and reused via @st.cache_data
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False)
 def _build_flashcard_html(front: str, back: str, hint: str, is_flipped: bool) -> str:
+    # Escape all user-supplied strings before embedding in HTML
     front_s = esc(front)
     back_s  = esc(back)
     hint_s  = esc(hint)
+    # Only render the hint block when a hint was actually provided
     hint_block = f'<div class="hint">💡 {hint_s}</div>' if hint_s else ''
     flip_cls   = "flipped" if is_flipped else ""
     return f"""<!DOCTYPE html><html><head>
@@ -380,26 +519,45 @@ if page == "💬  Chat":
     if not st.session_state.uploaded_files:
         no_docs_warning()
     else:
+        # Replay the full conversation from session state on each render
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
         user_input = st.chat_input("")
         if user_input:
+            # Ensure a session ID exists before the first message is stored
+            if not st.session_state.active_session_id:
+                import time
+                st.session_state.active_session_id = str(int(time.time()))
+ 
             st.session_state.chat_history.append({"role": "user", "content": user_input})
             with st.chat_message("user"):
                 st.markdown(user_input)
+ 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking…"):
-                    answer = run_agent(user_input, st.session_state.chat_history[:-1])
+                    try:
+                        # Pass history minus the just-appended user message to avoid duplication
+                        answer = run_agent(user_input, st.session_state.chat_history[:-1])
+                    except Exception as e:
+                        err = str(e)
+                        # Surface a friendly rate-limit message rather than a raw traceback
+                        if "429" in err or "rate_limit_exceeded" in err:
+                            answer = (
+                                "⚠️ Daily token limit reached for this model. "
+                                "Please wait a few minutes and try again, or upgrade to "
+                                "[Groq Dev Tier](https://console.groq.com/settings/billing) "
+                                "for more tokens."
+                            )
+                        else:
+                            answer = f"Something went wrong: {err}"
                 st.markdown(answer)
+ 
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-        if st.session_state.chat_history:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Clear conversation", type="secondary"):
-                st.session_state.chat_history = []
-                st.rerun()
+            # Persist to both in-memory session store and disk after every exchange
+            _save_current_session()
+            save_session(st.session_state.chat_history)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # QUIZ
@@ -428,10 +586,12 @@ elif page == "📝  Quiz":
             else:
                 with st.spinner("Crafting your quiz…"):
                     st.session_state.quiz_questions = generate_quiz(topic, num_q, quiz_type, difficulty)
+                # Reset answer and submission state for the new quiz
                 st.session_state.quiz_type      = quiz_type
                 st.session_state.quiz_answers   = {}
                 st.session_state.quiz_submitted = False
 
+        # Render unanswered questions only while the quiz hasn't been submitted
         if st.session_state.quiz_questions and not st.session_state.quiz_submitted:
             st.divider()
             st.markdown('<div class="quiz-radio">', unsafe_allow_html=True)
@@ -441,6 +601,7 @@ elif page == "📝  Quiz":
                     <span class="q-num">Q {i+1}</span>
                     <p class="q-text">{q['question']}</p>
                 </div>""", unsafe_allow_html=True)
+                # T/F questions get binary options; MCQ questions use the model-generated options list
                 opts = ["True", "False"] if st.session_state.quiz_type == "True/False" else q.get("options", [])
                 choice = st.radio(f"_q{i}", opts, key=f"q_{i}", label_visibility="collapsed")
                 st.session_state.quiz_answers[i] = choice
@@ -450,11 +611,13 @@ elif page == "📝  Quiz":
                 st.session_state.quiz_submitted = True
                 st.rerun()
 
+        # Results view — shown after the user submits
         if st.session_state.quiz_submitted and st.session_state.quiz_questions:
             user_answers = [st.session_state.quiz_answers.get(i, "") for i in range(len(st.session_state.quiz_questions))]
             ev    = evaluate_answers(st.session_state.quiz_questions, user_answers, quiz_type=st.session_state.get("quiz_type", "MCQ"))
             pct   = ev["percentage"]
             wrong = ev["total"] - ev["score"]
+            # Emoji verdict scales with score
             emoji = "🏆" if pct >= 80 else "👍" if pct >= 50 else "📚"
 
             st.markdown(f"""
@@ -469,6 +632,7 @@ elif page == "📝  Quiz":
             st.markdown(f"<h3 style='margin-top:14px;line-height:1.4;word-break:break-word;font-family:var(--font-h)'>{emoji} {verdict}</h3>", unsafe_allow_html=True)
             st.divider()
 
+            # Per-question breakdown in collapsible expanders
             for i, r in enumerate(ev["results"]):
                 icon    = "✅" if r["is_correct"] else "❌"
                 preview = r['question'][:60] + "…" if len(r['question']) > 60 else r['question']
@@ -489,6 +653,7 @@ elif page == "📝  Quiz":
 
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("New Quiz", type="secondary"):
+                # Reset all quiz state to allow generating a fresh quiz
                 st.session_state.quiz_questions = []
                 st.session_state.quiz_submitted  = False
                 st.rerun()
@@ -519,6 +684,7 @@ elif page == "🃏  Flashcards":
             else:
                 with st.spinner("Generating flashcards…"):
                     cards = generate_flashcards(fc_topic, num_cards)
+                # Store the new deck and reset all navigation/progress state
                 st.session_state.fc_cards   = cards
                 st.session_state.fc_index   = 0
                 st.session_state.fc_known   = set()
@@ -530,6 +696,7 @@ elif page == "🃏  Flashcards":
         cards = st.session_state.fc_cards
 
         if not cards:
+            # Empty state shown before any deck has been generated
             st.markdown("""
             <div class="empty-state">
                 <div class="icon">🃏</div>
@@ -543,9 +710,9 @@ elif page == "🃏  Flashcards":
             unknown = st.session_state.fc_unknown
             is_flip = st.session_state.fc_flipped
 
+            # Cards that haven't been marked either way are still "remaining"
             remaining = total - len(known) - len(unknown)
 
-            # Pills — stable size via min-width in CSS, no FOUC
             st.markdown(f"""
             <div class="fc-pills">
                 <span class="fc-pill g">✓ {len(known)}&nbsp;Know it</span>
@@ -553,7 +720,7 @@ elif page == "🃏  Flashcards":
                 <span class="fc-pill r">✗ {len(unknown)}&nbsp;Review</span>
             </div>""", unsafe_allow_html=True)
 
-            # Progress dots
+            # Progress dots row — current card is larger and accent-coloured
             dots = ""
             for i in range(total):
                 if i == idx:       c, s = "#7c6fff", "13px"
@@ -564,22 +731,21 @@ elif page == "🃏  Flashcards":
             st.markdown(f'<div class="fc-dots">{dots}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="card-ctr">{idx+1} of {total}</div>', unsafe_allow_html=True)
 
-            # ── Flip card (cached HTML) ────────────────────────────────────
+            # Render the 3-D flip card inside an isolated iframe via components.html
             components.html(
                 _build_flashcard_html(card["front"], card["back"], card.get("hint", ""), is_flip),
                 height=260,
                 scrolling=False,
             )
 
-            # Reveal / flip back
             st.markdown("<br>", unsafe_allow_html=True)
             rb1, _ = st.columns([1, 4])
             with rb1:
+                # Toggle flip state without advancing to the next card
                 if st.button("Reveal" if not is_flip else "Flip back", use_container_width=True, type="secondary"):
                     st.session_state.fc_flipped = not st.session_state.fc_flipped
                     st.rerun()
 
-            # Navigation row
             st.markdown("<br>", unsafe_allow_html=True)
             nb1, nb2, nb3, nb4, nb5 = st.columns(5)
 
@@ -590,6 +756,7 @@ elif page == "🃏  Flashcards":
                     st.rerun()
 
             with nb2:
+                # Mark card as known, remove from unknown set, advance automatically
                 if st.button("✓ Know it", use_container_width=True, disabled=(idx in known)):
                     st.session_state.fc_known.add(idx)
                     st.session_state.fc_unknown.discard(idx)
@@ -599,6 +766,7 @@ elif page == "🃏  Flashcards":
                     st.rerun()
 
             with nb3:
+                # Mark card for review, remove from known set, advance automatically
                 if st.button("◌ Learning", use_container_width=True, disabled=(idx in unknown)):
                     st.session_state.fc_unknown.add(idx)
                     st.session_state.fc_known.discard(idx)
@@ -614,6 +782,7 @@ elif page == "🃏  Flashcards":
                     st.rerun()
 
             with nb5:
+                # Shuffle resets all progress so the deck feels fresh
                 if st.button("🔀 Shuffle", use_container_width=True, type="secondary"):
                     random.shuffle(st.session_state.fc_cards)
                     st.session_state.fc_index   = 0
@@ -622,7 +791,7 @@ elif page == "🃏  Flashcards":
                     st.session_state.fc_unknown = set()
                     st.rerun()
 
-            # ── Round complete ─────────────────────────────────────────────
+            # Round-complete summary — shown once every card has been marked
             if len(known) + len(unknown) == total:
                 st.divider()
                 pct_k = round(len(known) / total * 100)
@@ -636,6 +805,7 @@ elif page == "🃏  Flashcards":
                 st.progress(pct_k / 100)
                 st.markdown(f"<h3 style='margin-top:14px;line-height:1.4;word-break:break-word;font-family:var(--font-h)'>{em} Round complete!</h3>", unsafe_allow_html=True)
 
+                # Expandable list of cards that still need review
                 if unknown:
                     st.divider()
                     st.markdown('<div class="review-title">Cards to review:</div>', unsafe_allow_html=True)
@@ -646,6 +816,7 @@ elif page == "🃏  Flashcards":
 
                 rc1, rc2 = st.columns(2)
                 with rc1:
+                    # Retry missed — rebuild the deck using only the cards marked for review
                     if st.button("Retry missed", use_container_width=True, type="primary"):
                         missed = [cards[i] for i in sorted(unknown)]
                         st.session_state.fc_cards   = missed
@@ -655,6 +826,7 @@ elif page == "🃏  Flashcards":
                         st.session_state.fc_flipped = False
                         st.rerun()
                 with rc2:
+                    # New deck — clear everything so the user can start a fresh topic
                     if st.button("New deck", use_container_width=True, type="secondary"):
                         st.session_state.fc_cards   = []
                         st.session_state.fc_index   = 0
