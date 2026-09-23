@@ -1,10 +1,29 @@
 import os
 import json
 import re
+from typing import cast
 from groq import Groq
+from groq.types.chat import ChatCompletion
 from rag.retriever import retrieve_context
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+PRIMARY_MODEL  = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
+
+
+def _create_with_fallback(**kwargs) -> ChatCompletion:
+    """Try primary model; on 429 automatically retry with the 8b fallback."""
+    for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
+        try:
+            return cast(ChatCompletion, client.chat.completions.create(model=model, **kwargs))
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "rate_limit_exceeded" in str(e)
+            if is_rate_limit and model == PRIMARY_MODEL:
+                print(f"[generator] {PRIMARY_MODEL} rate-limited, switching to {FALLBACK_MODEL}")
+                continue
+            raise
+    raise RuntimeError("Both models are rate-limited. Please wait a minute and try again.")
 
 
 def build_mcq_prompt(context, num_questions, topic, difficulty):
@@ -70,22 +89,17 @@ def extract_json(text: str):
     """Safely extract JSON from messy LLM output."""
     if not text:
         raise ValueError("Empty response")
-
-    # Strip markdown code fences
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             pass
-
     raise ValueError("No valid JSON found in LLM response")
 
 
@@ -98,27 +112,17 @@ def clean_mcq_answer(ans: str) -> str:
 
 
 def clean_tf_answer(ans: str) -> str:
-    """
-    Force True/False answer to exactly 'True' or 'False'.
-    Handles: 'true', 'TRUE', 'True', 'false', 'FALSE', 'False',
-             'A) True', 'A', 'B', '1', '0', 'yes', 'no'.
-    """
     if not ans:
         return "True"
-
     normalised = str(ans).strip().lower()
-
     if "true" in normalised:
         return "True"
     if "false" in normalised:
         return "False"
-
-    # LLM sometimes returns A/B where A = True, B = False
     if normalised in ("a", "1", "yes"):
         return "True"
     if normalised in ("b", "0", "no"):
         return "False"
-
     return "True"
 
 
@@ -126,15 +130,13 @@ def generate_quiz(topic: str, num_questions: int = 5, quiz_type: str = "MCQ", di
     context = retrieve_context(topic, n_results=6)
 
     is_tf = quiz_type.lower() in ("true/false", "truefalse", "true false", "tf")
-
     prompt = (
         build_tf_prompt(context, num_questions, topic, difficulty)
         if is_tf
         else build_mcq_prompt(context, num_questions, topic, difficulty)
     )
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    response = _create_with_fallback(
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
@@ -144,34 +146,27 @@ def generate_quiz(topic: str, num_questions: int = 5, quiz_type: str = "MCQ", di
     try:
         data = extract_json(content)
         questions = data.get("questions", [])
-
         if not isinstance(questions, list) or len(questions) == 0:
             raise ValueError("Invalid or empty questions list")
-
         for q in questions:
             if is_tf:
                 q["answer"] = clean_tf_answer(q.get("answer", ""))
-                q.pop("options", None)   # T/F questions don't need an options list
+                q.pop("options", None)
             else:
                 q["answer"] = clean_mcq_answer(q.get("answer", ""))
-
         return questions
 
     except Exception as e:
         print(f"[Quiz generation error] {e}\nRaw response:\n{content}")
         if is_tf:
-            return [
-                {
-                    "question": f"Could not generate quiz on '{topic}'. Please try again.",
-                    "answer": "True",
-                    "explanation": "Model output was invalid or not JSON-parseable.",
-                }
-            ]
-        return [
-            {
+            return [{
                 "question": f"Could not generate quiz on '{topic}'. Please try again.",
-                "options": ["A) Option A", "B) Option B", "C) Option C", "D) Option D"],
-                "answer": "A",
+                "answer": "True",
                 "explanation": "Model output was invalid or not JSON-parseable.",
-            }
-        ]
+            }]
+        return [{
+            "question": f"Could not generate quiz on '{topic}'. Please try again.",
+            "options": ["A) Option A", "B) Option B", "C) Option C", "D) Option D"],
+            "answer": "A",
+            "explanation": "Model output was invalid or not JSON-parseable.",
+        }]
